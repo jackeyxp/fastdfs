@@ -16,6 +16,8 @@
 #include "fastdfs_client.h"
 #include "fdfs_http_shared.h"
 
+#include "transmit.h"
+
 typedef struct
 {
 	TrackerServerGroup *pTrackerGroup;
@@ -99,6 +101,9 @@ const zend_fcall_info empty_fcall_info = { 0, NULL, NULL, NULL, NULL, 0, NULL, N
 
 // Every user visible function must have an entry in fastdfs_client_functions[].
 	zend_function_entry fastdfs_client_functions[] = {
+    ZEND_FE(transmit_connect_server, NULL)
+    ZEND_FE(transmit_disconnect_server, NULL)
+    ZEND_FE(transmit_command, NULL)
 		ZEND_FE(fastdfs_client_version, NULL)
 		ZEND_FE(fastdfs_active_test, NULL)
 		ZEND_FE(fastdfs_connect_server, NULL)
@@ -389,6 +394,285 @@ static void php_fdfs_tracker_close_all_connections_impl( \
 	RETURN_BOOL(true);
 }
 
+static int php_fdfs_get_server_from_hash(HashTable *tracker_hash, \
+		ConnectionInfo *pTrackerServer)
+{
+	zval *data;
+	char *ip_addr;
+	int ip_len;
+
+	memset(pTrackerServer, 0, sizeof(ConnectionInfo));
+	data = NULL;
+	if (zend_hash_find_wrapper(tracker_hash, "ip_addr", sizeof("ip_addr"), \
+			&data) == FAILURE)
+	{
+		logError("file: "__FILE__", line: %d, " \
+			"key \"ip_addr\" not exist!", __LINE__);
+		return ENOENT;
+	}
+	if (ZEND_TYPE_OF(data) != IS_STRING)
+	{
+		logError("file: "__FILE__", line: %d, " \
+			"key \"ip_addr\" is not string type, type=%d!", \
+			__LINE__, ZEND_TYPE_OF(data));
+		return EINVAL;
+	}
+
+	ip_addr = Z_STRVAL_P(data);
+	ip_len = Z_STRLEN_P(data);
+	if (ip_len >= IP_ADDRESS_SIZE)
+	{
+		ip_len = IP_ADDRESS_SIZE - 1;
+	}
+	memcpy(pTrackerServer->ip_addr, ip_addr, ip_len);
+
+	if (zend_hash_find_wrapper(tracker_hash, "port", sizeof("port"), \
+			&data) == FAILURE)
+	{
+		logError("file: "__FILE__", line: %d, " \
+			"key \"port\" not exist!", __LINE__);
+		return ENOENT;
+	}
+	if (ZEND_TYPE_OF(data) != IS_LONG)
+	{
+		logError("file: "__FILE__", line: %d, " \
+			"key \"port\" is not long type, type=%d!", \
+			__LINE__, ZEND_TYPE_OF(data));
+		return EINVAL;
+	}
+	pTrackerServer->port = data->value.lval;
+
+	if (zend_hash_find_wrapper(tracker_hash, "sock", sizeof("sock"), \
+			&data) == FAILURE)
+	{
+		logError("file: "__FILE__", line: %d, " \
+			"key \"sock\" not exist!", __LINE__);
+		return ENOENT;
+	}
+	if (ZEND_TYPE_OF(data) != IS_LONG)
+	{
+		logError("file: "__FILE__", line: %d, " \
+			"key \"sock\" is not long type, type=%d!", \
+			__LINE__, ZEND_TYPE_OF(data));
+		return EINVAL;
+	}
+
+	pTrackerServer->sock = data->value.lval;
+	return 0;
+}
+
+//////////////////////////////////////////////////////
+// 2017.04.23 - by jackey....
+//////////////////////////////////////////////////////
+static void php_transmit_connect_server_impl(INTERNAL_FUNCTION_PARAMETERS, FDFSPhpContext *pContext)
+{
+  int argc;
+  char *ip_addr;
+  zend_size_t ip_len;
+  long port;
+	ConnectionInfo server_info;
+  // check the input param...
+	argc = ZEND_NUM_ARGS();
+	if (argc != 2)
+	{
+		logError("[transmit] file: "__FILE__", line: %d, " \
+			"transmit_connect_server parameters count: %d != 2", \
+			__LINE__, argc);
+		pContext->err_no = EINVAL;
+		RETURN_BOOL(false);
+	}
+  // parse the ip_addr and port...
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "sl", \
+				&ip_addr, &ip_len, &port) == FAILURE)
+	{
+		logError("[transmit] file: "__FILE__", line: %d, " \
+			"zend_parse_parameters fail!", __LINE__);
+		pContext->err_no = EINVAL;
+		RETURN_BOOL(false);
+	}
+  // save server info...
+	snprintf(server_info.ip_addr, sizeof(server_info.ip_addr), "%s", ip_addr);
+	server_info.port = port;
+	server_info.sock = -1;
+  server_info.socket_domain = AF_INET;
+  // connect transmit server => conn_pool_connect_server...
+	if ((pContext->err_no=conn_pool_connect_server(&server_info, \
+			g_fdfs_network_timeout)) == 0)
+	{
+		array_init(return_value);
+		zend_add_assoc_stringl_ex(return_value, "ip_addr", \
+			sizeof("ip_addr"), ip_addr, ip_len, 1);
+		zend_add_assoc_long_ex(return_value, "port", sizeof("port"), \
+			port);
+		zend_add_assoc_long_ex(return_value, "sock", sizeof("sock"), \
+			server_info.sock);
+	}
+	else
+	{
+		RETURN_BOOL(false);
+	}
+}
+//
+// close the transmit connected socket...
+static void php_transmit_disconnect_server_impl(INTERNAL_FUNCTION_PARAMETERS, FDFSPhpContext *pContext)
+{
+	int argc;
+	zval *server_info;
+	HashTable *tracker_hash;
+	zval *data;
+	int sock;
+
+	argc = ZEND_NUM_ARGS();
+	if (argc != 1)
+	{
+		logError("[transmit] file: "__FILE__", line: %d, " \
+			"transmit_disconnect_server parameters count: %d != 1", \
+			__LINE__, argc);
+		pContext->err_no = EINVAL;
+		RETURN_BOOL(false);
+	}
+
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "a", \
+				&server_info) == FAILURE)
+	{
+		logError("[transmit] file: "__FILE__", line: %d, " \
+			"zend_parse_parameters fail!", __LINE__);
+		pContext->err_no = EINVAL;
+		RETURN_BOOL(false);
+	}
+
+	tracker_hash = Z_ARRVAL_P(server_info);
+	if (zend_hash_find_wrapper(tracker_hash, "sock", sizeof("sock"), \
+			&data) == FAILURE)
+	{
+		pContext->err_no = ENOENT;
+		RETURN_BOOL(false);
+	}
+
+	if (ZEND_TYPE_OF(data) == IS_LONG)
+	{
+		sock = data->value.lval;
+		if (sock >= 0)
+		{
+			close(sock);
+		}
+
+		CLEAR_HASH_SOCK_FIELD(tracker_hash)
+
+		pContext->err_no = 0;
+		RETURN_BOOL(true);
+	}
+	else
+	{
+		logError("[transmit] file: "__FILE__", line: %d, " \
+			"sock type is invalid, type=%d!", \
+			__LINE__, ZEND_TYPE_OF(data));
+		pContext->err_no = EINVAL;
+		RETURN_BOOL(false);
+	}
+}
+//
+// set gather info through the transmit connected socket...
+// int type, int cmd, ConnectionInfo server, string saveJson
+// return string => json
+static void php_transmit_command_impl(INTERNAL_FUNCTION_PARAMETERS, FDFSPhpContext *pContext)
+{
+	int argc;
+  long cmd;
+  long type;
+  int  result;
+  char *json_data;
+  zend_size_t json_len;
+	zval *server_info;
+	HashTable *tracker_hash;
+	ConnectionInfo server;
+	int saved_tracker_sock;
+
+	argc = ZEND_NUM_ARGS();
+	if (argc != 3 && argc != 4)
+	{
+		logError("[transmit] file: "__FILE__", line: %d, " \
+			"transmit_command parameters count: %d != 3 ", \
+			__LINE__, argc);
+		pContext->err_no = EINVAL;
+		RETURN_BOOL(false);
+	}
+
+  json_data = NULL; json_len = 0;
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "lla|s", \
+				&type, &cmd, &server_info, &json_data, &json_len) == FAILURE)
+	{
+		logError("[transmit] file: "__FILE__", line: %d, " \
+			"zend_parse_parameters fail!", __LINE__);
+		pContext->err_no = EINVAL;
+		RETURN_BOOL(false);
+	}
+
+	tracker_hash = Z_ARRVAL_P(server_info);
+
+	if( (pContext->err_no=php_fdfs_get_server_from_hash(tracker_hash, &server)) != 0 )
+	{
+		logError("[transmit] file: "__FILE__", line: %d, parse ConnectionInfo error!", __LINE__);
+		RETURN_BOOL(false);
+	}
+
+  // check the input socket value is validate...
+	if( server.sock <= 0 ) {
+    pContext->err_no = EINVAL;
+    RETURN_BOOL(false);
+  }
+  // save the tracker sock and save the flag...
+	saved_tracker_sock = server.sock;
+  
+  // prepare send data => must be set to 0...
+  int nSendSize = 0;
+  char szSendBuf[2048] = {0};
+  Cmd_Header cmdHeader = {0};
+  cmdHeader.m_pkg_len = ((json_data != NULL && json_len > 0) ? json_len : 0);
+  cmdHeader.m_sock = 0;
+  cmdHeader.m_cmd = cmd;
+  cmdHeader.m_type = type;
+  memcpy(szSendBuf, &cmdHeader, sizeof(cmdHeader));
+  nSendSize += sizeof(cmdHeader);
+  // check json data is validate...
+  if( json_data != NULL && json_len > 0 ) {
+    memcpy(szSendBuf+nSendSize, json_data, json_len);
+    nSendSize += json_len;
+  }
+  // send the data...
+  result = tcpsenddata_nb(server.sock, szSendBuf, nSendSize, g_fdfs_network_timeout);
+	if( result != 0 ) {
+		logError("[transmit] file: "__FILE__", line: %d, errno: %d, error info: %s", __LINE__,	result, STRERROR(result));
+    pContext->err_no = EINVAL;
+    RETURN_BOOL(false);
+	}
+  // receive response data...
+  int64_t in_bytes = 0;
+  char * json_buff = NULL;
+  result = fdfs_recv_response(&server, &json_buff, 0, &in_bytes);
+  if( result != 0 ) {
+		logError("[transmit] file: "__FILE__", line: %d, sock(%d), cmd(%d) errno: %d, error info: %s", __LINE__, server.sock, cmd,	result, STRERROR(result));
+    close(server.sock);
+    pContext->err_no = EINVAL;
+    RETURN_BOOL(false);
+  }
+  // check the tracker sock is validate...
+	if( tracker_hash != NULL && server.sock != saved_tracker_sock )
+	{
+    logError("[transmit] file: "__FILE__", line: %d, CLEAR_HASH_SOCK_FIELD", __LINE__);
+		CLEAR_HASH_SOCK_FIELD(tracker_hash)
+	}
+  // system will malloc the json_buff...
+  if( json_buff == NULL || in_bytes <= 0 ) {
+    logError("[transmit] file: "__FILE__", line: %d, none response data!", __LINE__);
+    pContext->err_no = EINVAL;
+    RETURN_BOOL(false);
+  }
+  // system will free the json_buff => ZEND_RETURN_STRING
+  json_buff[in_bytes] = '\0';
+  ZEND_RETURN_STRING(json_buff, in_bytes);
+}
+
 static void php_fdfs_connect_server_impl(INTERNAL_FUNCTION_PARAMETERS, \
 		FDFSPhpContext *pContext)
 {
@@ -567,73 +851,6 @@ static int php_fdfs_get_upload_callback_from_hash(HashTable *callback_hash, \
 		return EINVAL;
 	}
 
-	return 0;
-}
-
-static int php_fdfs_get_server_from_hash(HashTable *tracker_hash, \
-		ConnectionInfo *pTrackerServer)
-{
-	zval *data;
-	char *ip_addr;
-	int ip_len;
-
-	memset(pTrackerServer, 0, sizeof(ConnectionInfo));
-	data = NULL;
-	if (zend_hash_find_wrapper(tracker_hash, "ip_addr", sizeof("ip_addr"), \
-			&data) == FAILURE)
-	{
-		logError("file: "__FILE__", line: %d, " \
-			"key \"ip_addr\" not exist!", __LINE__);
-		return ENOENT;
-	}
-	if (ZEND_TYPE_OF(data) != IS_STRING)
-	{
-		logError("file: "__FILE__", line: %d, " \
-			"key \"ip_addr\" is not string type, type=%d!", \
-			__LINE__, ZEND_TYPE_OF(data));
-		return EINVAL;
-	}
-
-	ip_addr = Z_STRVAL_P(data);
-	ip_len = Z_STRLEN_P(data);
-	if (ip_len >= IP_ADDRESS_SIZE)
-	{
-		ip_len = IP_ADDRESS_SIZE - 1;
-	}
-	memcpy(pTrackerServer->ip_addr, ip_addr, ip_len);
-
-	if (zend_hash_find_wrapper(tracker_hash, "port", sizeof("port"), \
-			&data) == FAILURE)
-	{
-		logError("file: "__FILE__", line: %d, " \
-			"key \"port\" not exist!", __LINE__);
-		return ENOENT;
-	}
-	if (ZEND_TYPE_OF(data) != IS_LONG)
-	{
-		logError("file: "__FILE__", line: %d, " \
-			"key \"port\" is not long type, type=%d!", \
-			__LINE__, ZEND_TYPE_OF(data));
-		return EINVAL;
-	}
-	pTrackerServer->port = data->value.lval;
-
-	if (zend_hash_find_wrapper(tracker_hash, "sock", sizeof("sock"), \
-			&data) == FAILURE)
-	{
-		logError("file: "__FILE__", line: %d, " \
-			"key \"sock\" not exist!", __LINE__);
-		return ENOENT;
-	}
-	if (ZEND_TYPE_OF(data) != IS_LONG)
-	{
-		logError("file: "__FILE__", line: %d, " \
-			"key \"sock\" is not long type, type=%d!", \
-			__LINE__, ZEND_TYPE_OF(data));
-		return EINVAL;
-	}
-
-	pTrackerServer->sock = data->value.lval;
 	return 0;
 }
 
@@ -4515,6 +4732,37 @@ static void php_fdfs_gen_slave_filename_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	}
 
 	ZEND_RETURN_STRINGL(filename, filename_len, 1);
+}
+
+/////////////////////////////////////////////////////////
+// 2017.04.23 - by jackey...
+/////////////////////////////////////////////////////////
+/*
+array transmit_connect_server(string ip_addr, int port)
+return array for success, false for error
+*/
+ZEND_FUNCTION(transmit_connect_server)
+{
+	php_transmit_connect_server_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
+		&php_context);
+}
+/*
+boolean transmit_disconnect_server(array serverInfo)
+return true for success, false for error
+*/
+ZEND_FUNCTION(transmit_disconnect_server)
+{
+	php_transmit_disconnect_server_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
+		&php_context);
+}
+/*
+array transmit_command(int cmd, string gather_mac, array serverInfo, string saveJson)
+return array for success, false for error
+*/
+ZEND_FUNCTION(transmit_command)
+{
+	php_transmit_command_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
+		&php_context);
 }
 
 /*

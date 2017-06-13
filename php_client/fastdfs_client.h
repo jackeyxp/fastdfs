@@ -17,6 +17,10 @@ PHP_MSHUTDOWN_FUNCTION(fastdfs_client);
 PHP_RSHUTDOWN_FUNCTION(fastdfs_client);
 PHP_MINFO_FUNCTION(fastdfs_client);
 
+ZEND_FUNCTION(transmit_connect_server);
+ZEND_FUNCTION(transmit_disconnect_server);
+ZEND_FUNCTION(transmit_command);
+
 ZEND_FUNCTION(fastdfs_client_version);
 ZEND_FUNCTION(fastdfs_active_test);
 ZEND_FUNCTION(fastdfs_connect_server);
