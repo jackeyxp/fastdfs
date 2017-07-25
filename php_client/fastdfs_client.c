@@ -626,7 +626,7 @@ static void php_transmit_command_impl(INTERNAL_FUNCTION_PARAMETERS, FDFSPhpConte
   
   // prepare send data => must be set to 0...
   int nSendSize = 0;
-  char szSendBuf[2048] = {0};
+  char szSendBuf[2048 * 20] = {0};
   Cmd_Header cmdHeader = {0};
   cmdHeader.m_pkg_len = ((json_data != NULL && json_len > 0) ? json_len : 0);
   cmdHeader.m_sock = 0;
